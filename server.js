@@ -149,7 +149,7 @@ app.post('/track', trackLimiter, async (req, res) => {
       try {
         await visitsCollection.insertOne(visitData);
         isNew = true;
-        console.log(`📊 New visit: ${ip.substring(0, 10)}... → ${site}${page} (${metadata?.device || 'unknown'})`);
+        console.log(`📊 New visit: ${ip.substring(0, 10)}... → ${site}${page} (${metadata?.deviceType || 'unknown'})`);
       } catch (error) {
         if (error.code !== 11000) throw error;
         // Duplicate visit - это нормально
@@ -229,7 +229,7 @@ app.get('/stats', async (req, res) => {
       // По устройствам
       visitsCollection.aggregate([
         { $match: visitFilter },
-        { $group: { _id: '$metadata.device', count: { $sum: 1 } } },
+        { $group: { _id: '$metadata.deviceType', count: { $sum: 1 } } },
         { $sort: { count: -1 } }
       ]).toArray(),
       
@@ -293,7 +293,7 @@ app.get('/stats', async (req, res) => {
         ip: v.ip.substring(0, 10) + '...',
         site: v.site,
         page: v.page,
-        device: v.metadata?.device || 'unknown',
+        device: v.metadata?.deviceType || 'unknown',
         referrer: v.referrer
       })),
       recent_events: recentEvents.map(e => ({
