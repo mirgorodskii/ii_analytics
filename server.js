@@ -321,12 +321,27 @@ app.get('/stats', async (req, res) => {
   }
 });
 
-app.get('/stats/:site', async (req, res) => {
-  const adminKey = req.headers['x-admin-key'] || req.query.key;
-  
-  if (adminKey !== ADMIN_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+app.get('/stats', async (req, res) => {
+  // ... полная статистика
+});
+
+app.get('/stats/conversations', async (req, res) => {  // ← СНАЧАЛА СПЕЦИФИЧНЫЙ
+  // ... статистика разговоров
+});
+
+app.get('/stats/:site', async (req, res) => {  // ← ПОТОМ С ПАРАМЕТРОМ
+  // ... статистика по сайту
+});
+
+// ... дальше другие роуты ...
+
+app.post('/save_messages', async (req, res) => {
+  // ... сохранение сообщений
+});
+
+app.get('/visit/:id', async (req, res) => {
+  // ... получить визит
+});
   
   try {
     const { site } = req.params;
