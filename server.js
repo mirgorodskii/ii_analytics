@@ -141,23 +141,33 @@ app.post('/track', trackLimiter, async (req, res) => {
     
     let isNew = false;
     let eventType = event || 'visit';
+    let sessionId = null;
     
     // Для обычных визитов добавляем date для unique constraint
     if (eventType === 'visit' || !event) {
       visitData.date = date;
       
       try {
-        await visitsCollection.insertOne(visitData);
+        const result = await visitsCollection.insertOne(visitData);
         isNew = true;
+        sessionId = result.insertedId.toString();
         console.log(`📊 New visit: ${ip.substring(0, 10)}... → ${site}${page} (${metadata?.deviceType || 'unknown'})`);
       } catch (error) {
-        if (error.code !== 11000) throw error;
-        // Duplicate visit - это нормально
+        if (error.code === 11000) {
+          // Duplicate visit - найдем существующий
+          const existing = await visitsCollection.findOne({
+            ip, date, site
+          });
+          sessionId = existing?._id.toString();
+        } else {
+          throw error;
+        }
       }
     } else {
       // События (conversion, click, scroll, error, page_exit) - всегда записываем
-      await visitsCollection.insertOne(visitData);
+      const result = await visitsCollection.insertOne(visitData);
       isNew = true;
+      sessionId = result.insertedId.toString();
       
       const metaInfo = metadata?.type || metadata?.element?.text || metadata?.depth || '';
       console.log(`📊 Event: ${eventType} → ${site} ${metaInfo} (${ip.substring(0, 10)}...)`);
@@ -168,7 +178,8 @@ app.post('/track', trackLimiter, async (req, res) => {
     res.json({ 
       tracked: true,
       unique: isNew,
-      total
+      total,
+      sessionId  // ← ID визита для привязки диалогов
     });
     
   } catch (error) {
@@ -440,6 +451,177 @@ app.get('/admin/export', async (req, res) => {
   }
 });
 
+// ============================================
+// CONVERSATION TRACKING
+// ============================================
+
+// Save conversation messages to a visit
+app.post('/save_messages', async (req, res) => {
+  try {
+    const { sessionId, messages, metadata } = req.body;
+    
+    if (!sessionId || !messages) {
+      return res.status(400).json({ error: 'sessionId and messages required' });
+    }
+    
+    const { ObjectId } = require('mongodb');
+    
+    const result = await visitsCollection.updateOne(
+      { _id: new ObjectId(sessionId) },
+      { 
+        $set: { 
+          messages: messages,
+          conversation_metadata: metadata || {},
+          conversation_updated_at: new Date()
+        }
+      }
+    );
+    
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    
+    console.log(`💬 Saved ${messages.length} messages for session ${sessionId}`);
+    
+    res.json({ 
+      success: true,
+      messageCount: messages.length
+    });
+    
+  } catch (error) {
+    console.error('Save messages error:', error);
+    res.status(500).json({ error: 'Failed to save messages' });
+  }
+});
+
+// Get a specific visit with conversation
+app.get('/visit/:id', async (req, res) => {
+  const adminKey = req.headers['x-admin-key'] || req.query.key;
+  
+  if (adminKey !== ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  try {
+    const { ObjectId } = require('mongodb');
+    const visit = await visitsCollection.findOne({ 
+      _id: new ObjectId(req.params.id) 
+    });
+    
+    if (!visit) {
+      return res.status(404).json({ error: 'Visit not found' });
+    }
+    
+    res.json({
+      id: visit._id.toString(),
+      timestamp: visit.timestamp,
+      site: visit.site,
+      page: visit.page,
+      device: visit.metadata?.deviceType || 'unknown',
+      referrer: visit.referrer,
+      ip: visit.ip.substring(0, 10) + '...',
+      messages: visit.messages || [],
+      conversation_metadata: visit.conversation_metadata || null,
+      has_conversation: (visit.messages?.length || 0) > 0
+    });
+    
+  } catch (error) {
+    console.error('Get visit error:', error);
+    res.status(500).json({ error: 'Failed to get visit' });
+  }
+});
+
+// Get conversation statistics
+app.get('/stats/conversations', async (req, res) => {
+  const adminKey = req.headers['x-admin-key'] || req.query.key;
+  
+  if (adminKey !== ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  try {
+    // Визиты с разговорами
+    const withConversations = await visitsCollection.countDocuments({
+      messages: { $exists: true, $ne: [] }
+    });
+    
+    // Все визиты
+    const totalVisits = await visitsCollection.countDocuments({
+      event: { $in: ['visit', null] }
+    });
+    
+    // Конверсия визит → разговор
+    const conversionRate = totalVisits > 0 
+      ? ((withConversations / totalVisits) * 100).toFixed(2)
+      : 0;
+    
+    // Статистика по сообщениям
+    const conversationsWithMessages = await visitsCollection.find({
+      messages: { $exists: true, $ne: [] }
+    }).toArray();
+    
+    let totalMessages = 0;
+    let totalDuration = 0;
+    const byScenario = {};
+    const byVoice = {};
+    
+    for (const conv of conversationsWithMessages) {
+      const msgCount = conv.messages?.length || 0;
+      totalMessages += msgCount;
+      
+      const duration = conv.conversation_metadata?.duration || 0;
+      totalDuration += duration;
+      
+      const scenario = conv.conversation_metadata?.scenario || 'unknown';
+      byScenario[scenario] = (byScenario[scenario] || 0) + 1;
+      
+      const voice = conv.conversation_metadata?.voice || 'unknown';
+      byVoice[voice] = (byVoice[voice] || 0) + 1;
+    }
+    
+    const avgMessages = withConversations > 0 
+      ? (totalMessages / withConversations).toFixed(1)
+      : 0;
+    
+    const avgDuration = withConversations > 0
+      ? Math.round(totalDuration / withConversations)
+      : 0;
+    
+    // Последние разговоры
+    const recentConversations = await visitsCollection.find({
+      messages: { $exists: true, $ne: [] }
+    })
+    .sort({ conversation_updated_at: -1 })
+    .limit(10)
+    .toArray();
+    
+    res.json({
+      summary: {
+        total_visits: totalVisits,
+        with_conversations: withConversations,
+        conversion_rate: `${conversionRate}%`,
+        avg_messages_per_conversation: avgMessages,
+        avg_duration_seconds: avgDuration,
+        total_messages: totalMessages
+      },
+      by_scenario: byScenario,
+      by_voice: byVoice,
+      recent_conversations: recentConversations.map(c => ({
+        id: c._id.toString(),
+        time: c.conversation_updated_at || c.timestamp,
+        scenario: c.conversation_metadata?.scenario || 'unknown',
+        messageCount: c.messages?.length || 0,
+        duration: c.conversation_metadata?.duration || 0,
+        device: c.metadata?.deviceType || 'unknown'
+      }))
+    });
+    
+  } catch (error) {
+    console.error('Conversation stats error:', error);
+    res.status(500).json({ error: 'Failed to get conversation stats' });
+  }
+});
+
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
@@ -463,7 +645,8 @@ async function start() {
     console.log(`🚀 Server running on port ${PORT}`);
     console.log(`🍃 Database: Connected`);
     console.log(`🔑 Admin key: ${ADMIN_KEY === 'change-me-in-production' ? '⚠️  NOT SET!' : '✅ OK'}`);
-    console.log(`📈 Features: Visits + Events + Conversions`);
+    console.log(`📈 Features: Visits + Events + Conversations`);
+    console.log(`💬 New: Conversation tracking with sessionId`);
     console.log(`🕐 Time: ${new Date().toISOString()}`);
     console.log('='.repeat(50));
   });
