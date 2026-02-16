@@ -324,6 +324,7 @@ app.get('/stats', async (req, res) => {
       byDate,
       byDevice,
       byCountry,
+      byTimezone,
       recentVisits
     ] = await Promise.all([
       visitsCollection.countDocuments(visitFilter),
@@ -358,6 +359,13 @@ app.get('/stats', async (req, res) => {
         { $sort: { count: -1 } }
       ]).toArray(),
       
+      // Группировка по часовым поясам
+      visitsCollection.aggregate([
+        { $match: visitFilter },
+        { $group: { _id: '$metadata.timezone', count: { $sum: 1 } } },
+        { $sort: { count: -1 } }
+      ]).toArray(),
+      
       visitsCollection.find(visitFilter)
         .sort({ timestamp: -1 })
         .limit(50)
@@ -388,6 +396,10 @@ app.get('/stats', async (req, res) => {
         ...obj, 
         [item._id || 'Unknown']: item.count 
       }), {}),
+      by_timezone: byTimezone.reduce((obj, item) => ({ 
+        ...obj, 
+        [item._id || 'Unknown']: item.count 
+      }), {}),
       recent_visits: recentVisits.map(v => ({
         time: v.timestamp.toISOString(),
         ip: v.ip.substring(0, 10) + '...',
@@ -395,6 +407,7 @@ app.get('/stats', async (req, res) => {
         page: v.page,
         device: v.metadata?.deviceType || 'unknown',
         country: v.metadata?.country || 'Unknown',
+        timezone: v.metadata?.timezone || 'Unknown',
         referrer: v.referrer
       }))
     });
