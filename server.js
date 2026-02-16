@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { MongoClient } = require('mongodb');
+const geoip = require('geoip-lite');
 
 const app = express();
 
@@ -80,6 +81,32 @@ function getClientIP(req) {
          'unknown';
 }
 
+function getCountryFromIP(ip) {
+  try {
+    // Очистить IPv6 префикс если есть
+    const cleanIP = ip.replace('::ffff:', '');
+    
+    // Игнорировать локальные и приватные IP
+    if (cleanIP === 'unknown' || 
+        cleanIP.startsWith('127.') || 
+        cleanIP.startsWith('192.168.') ||
+        cleanIP.startsWith('10.') ||
+        cleanIP.startsWith('172.')) {
+      return 'Unknown';
+    }
+    
+    const geo = geoip.lookup(cleanIP);
+    if (geo && geo.country) {
+      return geo.country; // Код страны (US, GB, RU, etc)
+    }
+    
+    return 'Unknown';
+  } catch (error) {
+    console.error('GeoIP error:', error);
+    return 'Unknown';
+  }
+}
+
 function getTodayString() {
   return new Date().toISOString().split('T')[0];
 }
@@ -125,6 +152,9 @@ app.post('/track', trackLimiter, async (req, res) => {
     const timestamp = new Date();
     const date = getTodayString();
     
+    // Определяем страну по IP
+    const country = getCountryFromIP(ip);
+    
     const visitData = {
       ip,
       timestamp,
@@ -133,7 +163,10 @@ app.post('/track', trackLimiter, async (req, res) => {
       site: site || 'unknown',
       userAgent: req.headers['user-agent'],
       event: event || 'visit',
-      metadata: metadata || {}
+      metadata: {
+        ...(metadata || {}),
+        country: country // Добавляем страну
+      }
     };
     
     let isNew = false;
@@ -290,6 +323,7 @@ app.get('/stats', async (req, res) => {
       bySite,
       byDate,
       byDevice,
+      byCountry,
       recentVisits
     ] = await Promise.all([
       visitsCollection.countDocuments(visitFilter),
@@ -314,6 +348,13 @@ app.get('/stats', async (req, res) => {
       visitsCollection.aggregate([
         { $match: visitFilter },
         { $group: { _id: '$metadata.deviceType', count: { $sum: 1 } } },
+        { $sort: { count: -1 } }
+      ]).toArray(),
+      
+      // Группировка по странам
+      visitsCollection.aggregate([
+        { $match: visitFilter },
+        { $group: { _id: '$metadata.country', count: { $sum: 1 } } },
         { $sort: { count: -1 } }
       ]).toArray(),
       
@@ -343,12 +384,17 @@ app.get('/stats', async (req, res) => {
         ...obj, 
         [item._id || 'unknown']: item.count 
       }), {}),
+      by_country: byCountry.reduce((obj, item) => ({ 
+        ...obj, 
+        [item._id || 'Unknown']: item.count 
+      }), {}),
       recent_visits: recentVisits.map(v => ({
         time: v.timestamp.toISOString(),
         ip: v.ip.substring(0, 10) + '...',
         site: v.site,
         page: v.page,
         device: v.metadata?.deviceType || 'unknown',
+        country: v.metadata?.country || 'Unknown',
         referrer: v.referrer
       }))
     });
